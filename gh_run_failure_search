@@ -1,0 +1,124 @@
+#!/bin/bash
+###
+###   Usage: gh_run_failure_search since pattern
+###      
+###   Looks for a specific strings in all github workflow runs that failed
+###   Parameters:
+###      since - ID of the run to start the search (and all runs after that)
+###              (look for it in github action url)
+###      pattern - string/regex for grep search
+###    
+###    NB!
+###       1. Requires gh installed and in path.
+###          For more info see https://github.com/cli/cli#installation
+###
+###      2. Run command in repo folder
+###   
+###    
+###    Example:
+###          gh_run_failure_search 123456789 "mytest ([FA]"
+###          gh_run_failure_search 123456789 "missing.*CRYPTO"
+###
+###
+
+
+   if [[ $# -lt 2 ]]
+   then
+     grep ^### $0 | sed 's/^###//g'
+     exit
+   fi
+
+   since=$1
+   shift
+   pattern=\"$*\"
+   tmpfile=$(mktemp /tmp/gh_run_failure_search_in.XXXXXX)
+   logfile=$(mktemp /tmp/gh_run_failure_search_log.XXXXXX)
+   result=$(mktemp  /tmp/gh_run_failure_search_out.XXXXXX)
+
+   #fetch 100, 200, 400 ... up to 12800 runs"
+   back=100
+   for i in `seq 7`
+   do
+       echo "Info: Fetching $back last runs looking for $since ..."
+       gh run list -L $back  > $tmpfile
+       first_id=`tail -1 $tmpfile | cut -f7`
+       if [[ $first_id -lt $since ]]
+       then
+          break
+       fi
+       let back=$back*2
+   done
+
+   if [[ $first_id -gt $since ]]
+   then
+     echo "Warning: Unable to find $since in $back entries. First run id is $first_id"
+     since=$first_id
+   fi
+
+   command="grep $pattern $logfile > /dev/null"
+   processed=0
+   cat $tmpfile |
+   while read
+   do
+       let processed++
+       state=`echo "$REPLY" | cut -f1`
+       status=`echo "$REPLY" | cut -f2`
+       if [[ "$state" != "completed" || "$status" != "failure" ]]
+       then
+            continue
+       fi
+
+       id=`echo "$REPLY" | cut -f7`
+       if [[ $id < $since ]]
+       then
+           continue
+       fi
+       echo -ne "\rInfo: Checked $processed/$back runs"
+       gh run view $id --log-failed > $logfile 2>&1
+       rc=$?
+       if [[ $rc -ne 0 ]]
+       then
+         grep "rate limit" $logfile > /dev/null
+         if [[ $? -ne 0 ]]
+         then
+           continue
+         fi
+       fi
+       while [[ $rc -ne 0 ]]
+       do
+         echo -ne "\rWarning: Waiting for gh due to rate limit. Ctrl-C to exit"
+         sleep 30
+         gh run view $id --log-failed > $logfile 2>&1
+         rc=$?
+       done
+       eval $command
+       if [[ $? -eq 0 ]]
+       then
+           nm=`echo "$REPLY" | cut -f3`
+           wf=`echo "$REPLY" | cut -f4`
+           br=`echo "$REPLY" | cut -f5`
+           printf "%-48.48s\t%-16.16s\t%-32.32s\t%d\n" "$nm" "$wf" $br $id >> $result
+       fi
+   done
+   rm -f $tmpfile
+   echo
+   if [[ -s $result ]]
+   then
+       printf "\n\nAll runs with $pattern in failure log since $since:\n\n"
+       printf "%-48.48s\t%-16.16s\t%-32.32s\t%s\n" NAME WORKFLOW BRANCH ID
+       cat $result
+       rm -f $result
+   else
+       printf "\nNo $pattern has been found any failure log since $since\n"
+   fi
+   rm -f $logfile
+
+   if [[ -d /tmp/gh-cli-cache ]]
+   then
+     echo -ne "Delete gh-cli-cache? [Yn]:"
+     read a
+     if [[ "$a" != "n" && "$a" != "N" ]]
+     then
+       rm -rf /tmp/gh-cli-cache/*
+     fi
+   fi
